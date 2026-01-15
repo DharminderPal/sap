@@ -1,6 +1,178 @@
 /* ABAP */
 *******************************************************
 *
-*dharmidne pal abap developer
+email notification  send to vendor for pos
 
 
+REPORT ZPO.
+
+TABLES: ekko, ZTGATE_ITEM.
+
+TYPES: BEGIN OF ty_po_data,
+         ebeln TYPE ZTGATE_ITEM-ebeln,
+         ebelp TYPE ZTGATE_ITEM-ebelp,
+         matnr TYPE ekpo-matnr,
+         menge TYPE ekpo-menge,
+         werks TYPE ekpo-werks,
+         TXZ01 TYPE ekpo-TXZ01,
+         eindt TYPE eket-eindt,
+         smtp  TYPE adr6-smtp_addr,
+         lifnr TYPE ekko-lifnr,
+         name1 TYPE lfa1-name1,
+         bsart TYPE ekko-bsart,
+         loekz TYPE ekpo-loekz,
+         BEDAT TYPE ekko-BEDAT,
+       END OF ty_po_data.
+
+DATA: gt_po_data      TYPE TABLE OF ty_po_data,
+      gs_po_data      TYPE ty_po_data,
+      gt_gate_entry   TYPE TABLE OF ZTGATE_ITEM,
+      gs_gate_entry   TYPE ZTGATE_ITEM,
+      lv_future_date  TYPE sy-datum,
+      lv_days         TYPE i VALUE 9,
+      lt_body         TYPE bcsy_text,
+      lv_subject      TYPE so_obj_des,
+      lv_formatted_date TYPE string,
+      lt_unique_po    TYPE SORTED TABLE OF ty_po_data WITH UNIQUE KEY ebeln smtp lifnr name1,
+      lv_html_row     TYPE string,
+      lo_request      TYPE REF TO cl_bcs,
+      lo_document     TYPE REF TO cl_document_bcs,
+      lo_sender       TYPE REF TO if_sender_bcs,
+      lo_receiver     TYPE REF TO if_recipient_bcs,
+      sent_to_all     TYPE os_boolean,
+      lo_error        TYPE REF TO cx_bcs,
+      lv_has_gate_entry TYPE abap_bool.
+
+
+* Calculate target date
+lv_future_date = sy-datum + lv_days.
+lv_formatted_date = |{ lv_future_date+6(2) }-{ lv_future_date+4(2) }-{ lv_future_date(4) }|.
+
+
+* First SELECT: Get all PO data with delivery date = future date
+SELECT e~ebeln, e~ebelp, e~matnr, e~menge, e~werks, e~TXZ01,
+       k~eindt, a~smtp_addr, o~lifnr, v~name1, o~bsart, e~loekz, o~BEDAT
+  INTO TABLE @gt_po_data
+  FROM ekpo AS e
+  INNER JOIN eket AS k ON e~ebeln = k~ebeln AND e~ebelp = k~ebelp
+  INNER JOIN ekko AS o ON e~ebeln = o~ebeln
+  INNER JOIN lfa1 AS v ON o~lifnr = v~lifnr
+  LEFT JOIN adr6 AS a ON v~adrnr = a~addrnumber AND a~consnumber = '1'
+  WHERE k~eindt = @lv_future_date
+    AND e~loekz = ' '.
+
+IF gt_po_data IS INITIAL.
+  WRITE: / 'No POs found for delivery date:', lv_future_date.
+  EXIT.
+ENDIF.
+
+* Second SELECT: Get all gate entries
+SELECT *
+  INTO TABLE @gt_gate_entry
+  FROM ZTGATE_ITEM.
+
+* Collect unique vendors & POs (only non-deleted and without gate entry)
+LOOP AT gt_po_data INTO gs_po_data WHERE loekz = ' '.
+  "Check if this PO has gate entry
+  lv_has_gate_entry = abap_false.
+  LOOP AT gt_gate_entry INTO gs_gate_entry
+       WHERE ebeln = gs_po_data-ebeln
+         AND ebelp = gs_po_data-ebelp.
+    lv_has_gate_entry = abap_true.
+    EXIT.
+  ENDLOOP.
+
+  "Only include POs without gate entry
+  IF lv_has_gate_entry = abap_false.
+    INSERT gs_po_data INTO TABLE lt_unique_po.
+  ENDIF.
+ENDLOOP.
+
+IF lt_unique_po IS INITIAL.
+  WRITE: / 'All POs for delivery date', lv_future_date, 'already have gate entry. No emails to send.'.
+  EXIT.
+ENDIF.
+
+* Send email per vendor for POs without gate entry
+LOOP AT lt_unique_po INTO gs_po_data.
+
+  CLEAR lt_body.
+
+* Header
+  APPEND |Dear Vendor,<br><br>| TO lt_body.
+  APPEND |Please find attached/below the Open Order Report for orders due in the Next 7 days that Deepak Fasteners Limited has with your company.<br>| TO lt_body.
+  APPEND |Kindly review the table below and confirm whether you have a record of each listed order, and also provide the estimated shipping dates.<br><br>| TO lt_body.
+
+* Table
+  APPEND '<table border="1" cellpadding="4" cellspacing="0">' TO lt_body.
+  APPEND '<tr bgcolor="#d8e4bc"><th>PO Number</th><th>PO Document Date</th><th>PO Delivery Date</th><th>Line</th><th>Material</th><th>Description</th><th>Ordered Qty</th><th>Pending Qty</th></tr>' TO lt_body.
+
+  LOOP AT gt_po_data INTO DATA(ls_po_line)
+       WHERE ebeln = gs_po_data-ebeln
+         AND loekz = ' '.
+
+    "Check if this specific PO line has gate entry
+    lv_has_gate_entry = abap_false.
+    LOOP AT gt_gate_entry INTO gs_gate_entry
+         WHERE ebeln = ls_po_line-ebeln
+           AND ebelp = ls_po_line-ebelp.
+      lv_has_gate_entry = abap_true.
+      EXIT.
+    ENDLOOP.
+
+    "Only include PO lines without gate entry
+    IF lv_has_gate_entry = abap_false.
+      lv_html_row = |<tr><td>{ ls_po_line-ebeln }</td><td>{ ls_po_line-BEDAT }</td><td>{ lv_formatted_date }</td><td>{ ls_po_line-ebelp }</td><td>{ ls_po_line-matnr }</td><td>{ ls_po_line-TXZ01 }</td><td>{ ls_po_line-menge }</td><td>{ ls_po_line-menge
+}</td></tr>|.
+      APPEND lv_html_row TO lt_body.
+    ENDIF.
+  ENDLOOP.
+
+  APPEND '</table><br>' TO lt_body.
+
+* Footer
+  APPEND |<br>Purchasing Department<br>| TO lt_body.
+  APPEND |Deepak Fasteners Limited<br>| TO lt_body.
+  APPEND |Mall Road, Ludhiana<br>| TO lt_body.
+  APPEND |P: +91-161-5131111, 713111<br><br>| TO lt_body.
+  APPEND '<b>Note:</b> This is an auto-generated email. Please do not reply.' TO lt_body.
+
+* Subject
+  lv_subject = |Delivery update for PO { gs_po_data-ebeln } - Vendor: { gs_po_data-name1 }|.
+
+* Send email
+  TRY.
+      lo_request = cl_bcs=>create_persistent( ).
+
+      lo_document = cl_document_bcs=>create_document(
+                      i_type    = 'HTM'
+                      i_text    = lt_body
+                      i_subject = lv_subject ).
+
+      lo_request->set_document( lo_document ).
+
+      lo_sender = cl_cam_address_bcs=>create_internet_address( 'alert.in@deepakfasteners.in' ).
+      lo_request->set_sender( lo_sender ).
+*gs_po_data-smtp
+      IF gs_po_data-smtp IS NOT INITIAL.
+        lo_receiver = cl_cam_address_bcs=>create_internet_address( gs_po_data-smtp ) .
+        lo_request->add_recipient( lo_receiver ).
+      ELSE.
+        WRITE: / '⚠️ No email address for vendor:', gs_po_data-name1, 'PO:', gs_po_data-ebeln.
+        CONTINUE.
+      ENDIF.
+
+      sent_to_all = lo_request->send( i_with_error_screen = 'X' ).
+
+      IF sent_to_all = 'X'.
+        COMMIT WORK.
+        WRITE: / '✅ Email sent for PO:', gs_po_data-ebeln, 'Vendor:', gs_po_data-name1.
+      ELSE.
+        WRITE: / '❌ Email send failed for PO:', gs_po_data-ebeln.
+      ENDIF.
+
+    CATCH cx_bcs INTO lo_error.
+      WRITE: / '❌ Error sending PO:', gs_po_data-ebeln, '-', lo_error->get_text( ).
+  ENDTRY.
+
+ENDLOOP.
